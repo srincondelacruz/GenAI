@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Quick Draw — CNN</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: #0f0f0f;
+      color: #f0f0f0;
+      font-family: 'Segoe UI', sans-serif;
+      gap: 24px;
+      padding: 32px 16px;
+    }
+
+    h1 { font-size: 1.6rem; letter-spacing: 0.05em; color: #e0e0e0; }
+    p.hint { font-size: 0.85rem; color: #777; }
+
+    #canvas-wrapper {
+      position: relative;
+      border: 2px solid #333;
+      border-radius: 12px;
+      overflow: hidden;
+      cursor: crosshair;
+    }
+
+    canvas {
+      display: block;
+      background: #fff;
+    }
+
+    .controls {
+      display: flex;
+      gap: 12px;
+    }
+
+    button {
+      padding: 10px 28px;
+      border: none;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    button:hover { opacity: 0.85; }
+
+    #btn-predict { background: #4f8ef7; color: #fff; font-weight: 600; }
+    #btn-clear   { background: #333; color: #ccc; }
+
+    #result {
+      min-height: 80px;
+      text-align: center;
+    }
+
+    #result .category {
+      font-size: 2rem;
+      font-weight: 700;
+      color: #4f8ef7;
+      text-transform: capitalize;
+    }
+
+    #result .confidence {
+      font-size: 0.9rem;
+      color: #888;
+      margin-top: 4px;
+    }
+
+    #bars {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      width: 320px;
+    }
+
+    .bar-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.8rem;
+    }
+
+    .bar-label { width: 90px; text-align: right; color: #aaa; }
+
+    .bar-track {
+      flex: 1;
+      height: 10px;
+      background: #222;
+      border-radius: 5px;
+      overflow: hidden;
+    }
+
+    .bar-fill {
+      height: 100%;
+      background: #4f8ef7;
+      border-radius: 5px;
+      transition: width 0.4s ease;
+    }
+
+    .bar-pct { width: 36px; color: #666; }
+  </style>
+</head>
+<body>
+
+  <h1>Quick Draw Recognizer</h1>
+  <p class="hint">Dibuja una de estas: smiley face · face · flower · star · sun · cloud</p>
+
+  <div id="canvas-wrapper">
+    <canvas id="canvas" width="280" height="280"></canvas>
+  </div>
+
+  <div class="controls">
+    <button id="btn-clear">Borrar</button>
+    <button id="btn-predict">Reconocer</button>
+  </div>
+
+  <div id="result">
+    <div class="category" id="cat">—</div>
+    <div class="confidence" id="conf"></div>
+  </div>
+
+  <div id="bars"></div>
+
+  <script>
+    const canvas  = document.getElementById('canvas');
+    const ctx     = canvas.getContext('2d');
+    const API_URL = 'http://localhost:8000/predict';
+
+    let drawing = false;
+
+    ctx.lineWidth   = 12;
+    ctx.lineCap     = 'round';
+    ctx.strokeStyle = '#000';
+    ctx.fillStyle   = '#fff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    function pos(e) {
+      const r = canvas.getBoundingClientRect();
+      if (e.touches) {
+        return { x: e.touches[0].clientX - r.left, y: e.touches[0].clientY - r.top };
+      }
+      return { x: e.clientX - r.left, y: e.clientY - r.top };
+    }
+
+    canvas.addEventListener('mousedown',  e => { drawing = true; ctx.beginPath(); const p = pos(e); ctx.moveTo(p.x, p.y); });
+    canvas.addEventListener('mousemove',  e => { if (!drawing) return; const p = pos(e); ctx.lineTo(p.x, p.y); ctx.stroke(); });
+    canvas.addEventListener('mouseup',    () => drawing = false);
+    canvas.addEventListener('mouseleave', () => drawing = false);
+
+    canvas.addEventListener('touchstart',  e => { e.preventDefault(); drawing = true; ctx.beginPath(); const p = pos(e); ctx.moveTo(p.x, p.y); });
+    canvas.addEventListener('touchmove',   e => { e.preventDefault(); if (!drawing) return; const p = pos(e); ctx.lineTo(p.x, p.y); ctx.stroke(); });
+    canvas.addEventListener('touchend',    () => drawing = false);
+
+    document.getElementById('btn-clear').addEventListener('click', () => {
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      document.getElementById('cat').textContent  = '—';
+      document.getElementById('conf').textContent = '';
+      document.getElementById('bars').innerHTML   = '';
+    });
+
+    document.getElementById('btn-predict').addEventListener('click', async () => {
+      const image = canvas.toDataURL('image/png');
+      try {
+        const res  = await fetch(API_URL, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ image })
+        });
+        const data = await res.json();
+
+        document.getElementById('cat').textContent  = data.category;
+        document.getElementById('conf').textContent = `confianza: ${(data.confidence * 100).toFixed(1)}%`;
+
+        const bars = document.getElementById('bars');
+        bars.innerHTML = '';
+        for (const [label, prob] of Object.entries(data.all_probs).sort((a, b) => b[1] - a[1])) {
+          const pct = (prob * 100).toFixed(1);
+          bars.innerHTML += `
+            <div class="bar-row">
+              <span class="bar-label">${label}</span>
+              <div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>
+              <span class="bar-pct">${pct}%</span>
+            </div>`;
+        }
+      } catch {
+        document.getElementById('cat').textContent  = 'Error';
+        document.getElementById('conf').textContent = 'No se pudo conectar con la API';
+      }
+    });
+  </script>
+</body>
+</html>
