@@ -1,0 +1,8 @@
+# Datos de entrenamiento
+data/
+
+# Modelos entrenados
+*.pth
+
+# Checkpoints de Jupyter
+.ipynb_checkpoints/
