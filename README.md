@@ -7,7 +7,7 @@ El módulo se divide en dos itinerarios complementarios: uno centrado en **consu
 ---
 
 ## Estructura
-
+gpt_dev
 ```
 GenAI-client/                         # Itinerario cloud — Azure AI
   01-Foundry_Exploration/              # Texto, JSON estructurado, guardrails, razonamiento, multimodal
