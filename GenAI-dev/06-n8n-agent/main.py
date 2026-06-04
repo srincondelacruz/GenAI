@@ -28,7 +28,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_message = update.message.text
 
     result = await run_agent(user_message, str(chat_id))
-    response = result["output"]
+    response = result["output"].strip()
+
+    # El agente puede devolver vacío si la pregunta no requiere herramientas
+    if not response:
+        await update.message.reply_text("No he podido generar una respuesta, inténtalo de nuevo.")
+        return
 
     if result["used_serpapi"]:
         # Guarda la pregunta y respuesta para usarlas si el usuario confirma el envío
@@ -46,7 +51,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     else:
         # Respuesta normal sin búsqueda web
-        await update.message.reply_text(response)
+        # Trunca si supera el límite de Telegram (4096 caracteres)
+        await update.message.reply_text(response[:4096])
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

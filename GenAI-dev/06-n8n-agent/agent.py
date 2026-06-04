@@ -80,11 +80,19 @@ No uses ### ni ningún otro encabezado Markdown."""),
         tools=tools,
         memory=_get_memory(chat_id),
         verbose=True,
+        return_intermediate_steps=True,
     )
 
     result = await executor.ainvoke({"input": message})
 
+    # El output puede quedar vacío cuando la respuesta contiene bloques de código.
+    # En ese caso recuperamos el contenido del último paso intermedio del agente.
+    output = result.get("output", "").strip()
+    if not output and result.get("intermediate_steps"):
+        last_step = result["intermediate_steps"][-1]
+        output = str(last_step[-1]) if last_step else ""
+
     return {
-        "output": result["output"],
+        "output": output,
         "used_serpapi": used["serpapi"],
     }
