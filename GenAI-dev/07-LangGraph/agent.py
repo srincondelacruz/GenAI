@@ -1,24 +1,28 @@
 """
 Email Agent — LangGraph + Azure OpenAI + Gmail IMAP/SMTP
-Flujo: fetch → classify → router → draft → human_review → send | summarize | archive → END
+Flujo: fetch → [MAP via Send] → N × email_pipeline (sub-grafo) → [REDUCE] → send_summary
 
-Human-in-the-Loop: antes de enviar cualquier respuesta urgente el agente se detiene,
-muestra el borrador y espera aprobación explícita del operador.
+Map-Reduce : fetch despacha cada email como sub-grafo paralelo independiente.
+             Cada sub-grafo tiene su propio estado aislado; solo 'processed' sube
+             al grafo padre mediante el reducer Annotated[list, operator.add].
+HITL       : dentro del sub-grafo, human_review_node pausa la rama urgente.
+Paralelismo: para emails urgentes, draft y analyze corren en paralelo en el sub-grafo.
 """
 
+import operator
 import os
 import imaplib
 import email
 import smtplib
 from email.mime.text import MIMEText
-from typing import TypedDict
+from typing import Annotated, TypedDict
 
 from dotenv import load_dotenv
 from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.types import interrupt, Command
+from langgraph.types import interrupt, Command, Send
 
 load_dotenv()
 
@@ -36,31 +40,35 @@ GMAIL_ADDRESS  = os.getenv("GMAIL_ADDRESS")
 GMAIL_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
 
-# ── Estado del agente ─────────────────────────────────────────────────────────
+# ── Estados ───────────────────────────────────────────────────────────────────
+
+class EmailState(TypedDict):
+    """Estado privado de cada sub-grafo (un email)."""
+    current_email:  dict
+    classification: str
+    draft_reply:    str
+    summary:        str
+    approved:       bool
+    human_feedback: str
+    analysis:       str
+    processed:      list[dict]   # local; el reducer lo integra en AgentState
+
 
 class AgentState(TypedDict):
-    emails: list[dict]          # emails pendientes de procesar
-    current_email: dict         # email que se está procesando ahora
-    classification: str         # "urgent" | "info" | "spam"
-    draft_reply: str            # borrador de respuesta (solo urgent)
-    summary: str                # resumen de una línea (solo info)
-    processed: list[dict]       # log de todos los emails procesados
-    approved: bool              # HITL: True si el operador aprobó el borrador
-    human_feedback: str         # HITL: texto alternativo si el operador editó el borrador
-    analysis: str               # PARALELO: análisis de puntos clave extraído junto con el borrador
+    """Estado del grafo principal."""
+    emails:    list[dict]
+    processed: Annotated[list[dict], operator.add]   # REDUCE: acumula todas las ramas
 
 
-# ── Gmail helpers (IMAP) ──────────────────────────────────────────────────────
+# ── Gmail helpers ─────────────────────────────────────────────────────────────
 
 def get_imap_connection() -> imaplib.IMAP4_SSL:
-    """Abre una conexión IMAP autenticada con Gmail."""
     conn = imaplib.IMAP4_SSL("imap.gmail.com")
     conn.login(GMAIL_ADDRESS, GMAIL_PASSWORD)
     return conn
 
 
 def decode_header_value(value: str) -> str:
-    """Decodifica headers de email que pueden estar en base64 o quoted-printable."""
     from email.header import decode_header
     parts = decode_header(value or "")
     result = []
@@ -73,7 +81,6 @@ def decode_header_value(value: str) -> str:
 
 
 def extract_body(msg: email.message.Message) -> str:
-    """Extrae el texto plano del cuerpo del email."""
     if msg.is_multipart():
         for part in msg.walk():
             if part.get_content_type() == "text/plain":
@@ -86,25 +93,20 @@ def extract_body(msg: email.message.Message) -> str:
     return ""
 
 
-# ── Nodos ─────────────────────────────────────────────────────────────────────
+# ── Nodo de fetch (grafo principal) ──────────────────────────────────────────
 
-def fetch_node(state: AgentState) -> AgentState:
-    """
-    Conecta a Gmail via IMAP y lee los últimos 10 emails no leídos de la bandeja
-    de entrada. Extrae subject, remitente, uid y primeros 2000 caracteres del body.
-    """
+def fetch_node(state: AgentState) -> dict:
     conn = get_imap_connection()
     conn.select("INBOX")
 
     _, uids = conn.search(None, "UNSEEN")
-    uid_list = uids[0].split()[-10:]   # últimos 10 no leídos
+    uid_list = uids[0].split()[-10:]
 
     emails = []
     for uid in uid_list:
         _, data = conn.fetch(uid, "(RFC822)")
         raw = data[0][1]
         msg = email.message_from_bytes(raw)
-
         emails.append({
             "uid":     uid.decode(),
             "subject": decode_header_value(msg.get("Subject", "(sin asunto)")),
@@ -114,18 +116,14 @@ def fetch_node(state: AgentState) -> AgentState:
 
     conn.logout()
     print(f"[fetch] {len(emails)} emails no leídos encontrados")
-    return {**state, "emails": emails, "processed": []}
+    return {"emails": emails}
 
 
-def classify_node(state: AgentState) -> AgentState:
-    """
-    Extrae el primer email de la cola y lo clasifica con el LLM en:
-    'urgent' (requiere respuesta), 'info' (informativo) o 'spam'.
-    Elimina el email de la lista para que el bucle avance.
-    """
-    emails = state["emails"]
-    current = emails[0]
+# ── Nodos del sub-grafo (procesan UN email) ───────────────────────────────────
 
+def classify_node(state: EmailState) -> dict:
+    """MAP: clasifica el email asignado a esta rama."""
+    current = state["current_email"]
     prompt = f"""Clasifica el siguiente email en exactamente una de estas categorías:
 - urgent: requiere respuesta o acción inmediata
 - info: informativo, no requiere acción
@@ -139,28 +137,19 @@ Contenido: {current['body'][:500]}
 """
     response = llm.invoke([HumanMessage(content=prompt)])
     classification = response.content.strip().lower()
-
     if classification not in ("urgent", "info", "spam"):
         classification = "info"
-
     print(f"[classify] '{current['subject']}' → {classification}")
-    return {
-        **state,
-        "current_email":  current,
-        "emails":         emails[1:],
-        "classification": classification,
-        "draft_reply":    "",
-        "summary":        "",
-    }
+    return {"classification": classification, "draft_reply": "", "summary": "", "analysis": ""}
 
 
-def draft_node(state: AgentState) -> AgentState:
-    """
-    Para emails urgentes: redacta una respuesta profesional con el LLM y la guarda
-    en el estado. No envía el email — solo genera el borrador para revisión humana.
-    """
+def urgent_dispatch_node(state: EmailState) -> dict:
+    """Nodo puente para el fan-out paralelo draft + analyze dentro del sub-grafo."""
+    return {}
+
+
+def draft_node(state: EmailState) -> dict:
     email_data = state["current_email"]
-
     prompt = f"""Redacta una respuesta profesional y concisa al siguiente email.
 La respuesta debe ser breve (máximo 3 párrafos) y en el mismo idioma que el email original.
 
@@ -170,25 +159,13 @@ Contenido: {email_data['body']}
 """
     response = llm.invoke([HumanMessage(content=prompt)])
     draft = response.content.strip()
-
     print(f"[draft] Borrador generado para '{email_data['subject']}'")
-
-    # Devuelve solo los campos que modifica (regla en nodos paralelos)
     return {"draft_reply": draft, "approved": False, "human_feedback": ""}
 
 
-def urgent_dispatch_node(state: AgentState) -> AgentState:
-    """Nodo puente que activa el fan-out paralelo draft + analyze para emails urgentes."""
-    return state
-
-
-def analyze_node(state: AgentState) -> AgentState:
-    """
-    PARALELO con draft_node: analiza el email urgente y extrae puntos clave,
-    acción requerida e indicadores de urgencia para ayudar al revisor humano.
-    """
+def analyze_node(state: EmailState) -> dict:
+    """PARALELO con draft: extrae puntos clave del email urgente."""
     email_data = state["current_email"]
-
     prompt = f"""Analiza el siguiente email urgente y responde en formato estructurado:
 
 1. PUNTOS CLAVE (máximo 3 bullets)
@@ -201,46 +178,32 @@ Contenido: {email_data['body'][:800]}
 """
     response = llm.invoke([HumanMessage(content=prompt)])
     analysis = response.content.strip()
-
     print(f"[analyze] Análisis completado para '{email_data['subject']}'")
-
-    # Devuelve solo los campos que modifica (regla en nodos paralelos)
     return {"analysis": analysis}
 
 
-def human_review_node(state: AgentState) -> AgentState:
-    """
-    HITL: pausa el grafo y muestra el borrador al operador.
-    El operador puede responder:
-      - 'approve'        → enviar el borrador tal cual
-      - 'reject'         → descartar el borrador, no enviar nada
-      - 'edit: <texto>'  → reemplazar el borrador con el texto indicado y enviar
-    """
+def human_review_node(state: EmailState) -> dict:
+    """HITL: pausa el sub-grafo y espera decisión del operador."""
     email_data = state["current_email"]
     decision: str = interrupt({
-        "action":    "review_draft",
-        "subject":   email_data["subject"],
-        "from":      email_data["from"],
-        "draft":     state["draft_reply"],
-        "analysis":  state.get("analysis", ""),
+        "action":       "review_draft",
+        "subject":      email_data["subject"],
+        "from":         email_data["from"],
+        "draft":        state["draft_reply"],
+        "analysis":     state.get("analysis", ""),
         "instructions": "Responde 'approve', 'reject' o 'edit: <nuevo texto>'",
     })
-
     decision = decision.strip()
     if decision.lower().startswith("edit:"):
         new_draft = decision[5:].strip()
-        return {**state, "approved": True, "draft_reply": new_draft, "human_feedback": new_draft}
+        return {"approved": True, "draft_reply": new_draft, "human_feedback": new_draft}
     elif decision.lower() == "approve":
-        return {**state, "approved": True, "human_feedback": ""}
+        return {"approved": True, "human_feedback": ""}
     else:
-        return {**state, "approved": False, "human_feedback": ""}
+        return {"approved": False, "human_feedback": ""}
 
 
-def send_node(state: AgentState) -> AgentState:
-    """
-    Envía el borrador aprobado al remitente del email original via SMTP de Gmail.
-    Solo se ejecuta si el operador aprobó (approved=True).
-    """
+def send_node(state: EmailState) -> dict:
     email_data = state["current_email"]
     draft = state["draft_reply"]
     recipient = email_data["from"]
@@ -255,47 +218,29 @@ def send_node(state: AgentState) -> AgentState:
         server.login(GMAIL_ADDRESS, GMAIL_PASSWORD)
         server.sendmail(GMAIL_ADDRESS, [recipient], msg.as_string())
 
-    print(f"[send] Respuesta enviada a '{recipient}' (asunto: {subject})")
-
-    return {
-        **state,
-        "processed": state["processed"] + [{
-            "subject":        email_data["subject"],
-            "from":           email_data["from"],
-            "classification": "urgent",
-            "action":         "respuesta enviada",
-            "draft":          draft,
-        }],
-    }
+    print(f"[send] Respuesta enviada a '{recipient}'")
+    return {"processed": [{
+        "subject":        email_data["subject"],
+        "from":           email_data["from"],
+        "classification": "urgent",
+        "action":         "respuesta enviada",
+        "draft":          draft,
+    }]}
 
 
-def skip_send_node(state: AgentState) -> AgentState:
-    """Registra el email urgente como descartado cuando el operador rechazó el borrador."""
+def skip_send_node(state: EmailState) -> dict:
     email_data = state["current_email"]
     print(f"[skip_send] Borrador rechazado para '{email_data['subject']}'")
-    return {
-        **state,
-        "processed": state["processed"] + [{
-            "subject":        email_data["subject"],
-            "from":           email_data["from"],
-            "classification": "urgent",
-            "action":         "borrador rechazado",
-        }],
-    }
+    return {"processed": [{
+        "subject":        email_data["subject"],
+        "from":           email_data["from"],
+        "classification": "urgent",
+        "action":         "borrador rechazado",
+    }]}
 
 
-def review_router(state: AgentState) -> str:
-    """Dirige a send si el operador aprobó, o a skip_send si rechazó."""
-    return "send" if state.get("approved") else "skip_send"
-
-
-def summarize_node(state: AgentState) -> AgentState:
-    """
-    Para emails informativos: genera un resumen de una sola frase con el LLM.
-    Permite tener un log rápido de lo recibido sin leer cada email completo.
-    """
+def summarize_node(state: EmailState) -> dict:
     email_data = state["current_email"]
-
     prompt = f"""Resume en UNA sola frase (máximo 15 palabras) el contenido del siguiente email.
 Responde solo con la frase, sin puntuación final ni comillas.
 
@@ -304,13 +249,10 @@ Contenido: {email_data['body'][:300]}
 """
     response = llm.invoke([HumanMessage(content=prompt)])
     summary = response.content.strip().rstrip(".")
-
     print(f"[summarize] '{email_data['subject']}' → {summary}")
-
     return {
-        **state,
         "summary": summary,
-        "processed": state["processed"] + [{
+        "processed": [{
             "subject":        email_data["subject"],
             "from":           email_data["from"],
             "classification": "info",
@@ -320,58 +262,45 @@ Contenido: {email_data['body'][:300]}
     }
 
 
-def archive_node(state: AgentState) -> AgentState:
-    """
-    Para emails spam: mueve el email a la carpeta [Gmail]/Spam via IMAP.
-    Copia el mensaje a Spam y lo elimina de INBOX marcándolo como borrado.
-    """
+def archive_node(state: EmailState) -> dict:
     email_data = state["current_email"]
     uid = email_data["uid"]
 
     conn = get_imap_connection()
     conn.select("INBOX")
-
-    # Copia a Spam y borra de INBOX
     conn.uid("COPY", uid, "[Gmail]/Spam")
     conn.uid("STORE", uid, "+FLAGS", "\\Deleted")
     conn.expunge()
     conn.logout()
 
     print(f"[archive] '{email_data['subject']}' movido a spam")
-
-    return {
-        **state,
-        "processed": state["processed"] + [{
-            "subject":        email_data["subject"],
-            "from":           email_data["from"],
-            "classification": "spam",
-            "action":         "archivado como spam",
-        }],
-    }
+    return {"processed": [{
+        "subject":        email_data["subject"],
+        "from":           email_data["from"],
+        "classification": "spam",
+        "action":         "archivado como spam",
+    }]}
 
 
-# ── Router y condición de parada ──────────────────────────────────────────────
+# ── Routers del sub-grafo ─────────────────────────────────────────────────────
 
-def router(state: AgentState) -> str:
-    """Devuelve el nodo siguiente según la clasificación del email actual."""
+def router(state: EmailState) -> str:
     return state["classification"]
 
 
-def should_continue(state: AgentState) -> str:
-    """Si quedan emails en la cola vuelve a classify; si no, pasa al resumen final."""
-    return "classify" if state["emails"] else "send_summary"
+def review_router(state: EmailState) -> str:
+    return "send" if state.get("approved") else "skip_send"
 
 
-def send_summary_node(state: AgentState) -> AgentState:
-    """
-    Nodo final: envía un email de resumen consolidado con todos los emails
-    informativos procesados. Si no hay ninguno, no envía nada.
-    """
+# ── Nodo reduce (grafo principal) ─────────────────────────────────────────────
+
+def send_summary_node(state: AgentState) -> dict:
+    """REDUCE: recibe todos los processed de las ramas y envía el resumen por email."""
     info_emails = [e for e in state["processed"] if e.get("summary")]
 
     if not info_emails:
         print("[send_summary] Sin emails informativos, no se envía resumen.")
-        return state
+        return {}
 
     lines = ["Resumen de emails informativos recibidos:\n"]
     for i, e in enumerate(info_emails, 1):
@@ -392,56 +321,80 @@ def send_summary_node(state: AgentState) -> AgentState:
         server.sendmail(GMAIL_ADDRESS, [GMAIL_ADDRESS], msg.as_string())
 
     print(f"[send_summary] Resumen enviado a {GMAIL_ADDRESS} ({len(info_emails)} emails)")
-    return state
+    return {}
 
 
-# ── Construcción del grafo ────────────────────────────────────────────────────
+# ── Sub-grafo: pipeline de un email ──────────────────────────────────────────
+
+def build_email_subgraph():
+    """Construye el sub-grafo que procesa UN email con HITL y paralelismo interno."""
+    g = StateGraph(EmailState)
+
+    g.add_node("classify",        classify_node)
+    g.add_node("urgent_dispatch", urgent_dispatch_node)
+    g.add_node("draft",           draft_node)
+    g.add_node("analyze",         analyze_node)
+    g.add_node("human_review",    human_review_node)
+    g.add_node("send",            send_node)
+    g.add_node("skip_send",       skip_send_node)
+    g.add_node("summarize",       summarize_node)
+    g.add_node("archive",         archive_node)
+
+    g.set_entry_point("classify")
+    g.add_conditional_edges("classify", router,
+                            {"urgent": "urgent_dispatch", "info": "summarize", "spam": "archive"})
+
+    # Fan-out paralelo dentro del sub-grafo (urgentes)
+    g.add_edge("urgent_dispatch", "draft")
+    g.add_edge("urgent_dispatch", "analyze")
+    g.add_edge("draft",   "human_review")
+    g.add_edge("analyze", "human_review")
+    g.add_conditional_edges("human_review", review_router, {"send": "send", "skip_send": "skip_send"})
+
+    for node in ("send", "skip_send", "summarize", "archive"):
+        g.add_edge(node, END)
+
+    return g.compile()
+
+
+email_pipeline = build_email_subgraph()
+
+
+# ── MAP: despacha emails al sub-grafo ─────────────────────────────────────────
+
+def dispatch_emails(state: AgentState) -> list[Send]:
+    """MAP: crea una rama paralela por cada email detectado."""
+    return [
+        Send("email_pipeline", {
+            "current_email":  e,
+            "classification": "",
+            "draft_reply":    "",
+            "summary":        "",
+            "approved":       False,
+            "human_feedback": "",
+            "analysis":       "",
+            "processed":      [],
+        })
+        for e in state["emails"]
+    ]
+
+
+# ── Grafo principal ───────────────────────────────────────────────────────────
 
 def build_graph(checkpointer=None):
     graph = StateGraph(AgentState)
 
-    graph.add_node("fetch",            fetch_node)
-    graph.add_node("classify",         classify_node)
-    graph.add_node("urgent_dispatch",  urgent_dispatch_node)
-    graph.add_node("draft",            draft_node)
-    graph.add_node("analyze",          analyze_node)
-    graph.add_node("human_review",     human_review_node)
-    graph.add_node("send",             send_node)
-    graph.add_node("skip_send",        skip_send_node)
-    graph.add_node("summarize",        summarize_node)
-    graph.add_node("archive",          archive_node)
-    graph.add_node("send_summary",     send_summary_node)
+    graph.add_node("fetch",          fetch_node)
+    graph.add_node("email_pipeline", email_pipeline)
+    graph.add_node("send_summary",   send_summary_node)
 
     graph.set_entry_point("fetch")
-    graph.add_edge("fetch", "classify")
 
-    graph.add_conditional_edges(
-        "classify",
-        router,
-        {"urgent": "urgent_dispatch", "info": "summarize", "spam": "archive"}
-    )
+    # fetch → MAP (N ramas paralelas, una por email)
+    graph.add_conditional_edges("fetch", dispatch_emails, ["email_pipeline"])
 
-    # Fan-out paralelo: urgent_dispatch lanza draft y analyze simultáneamente
-    graph.add_edge("urgent_dispatch", "draft")
-    graph.add_edge("urgent_dispatch", "analyze")
-
-    # Fan-in: human_review espera a que draft y analyze terminen antes de ejecutarse
-    graph.add_edge("draft",   "human_review")
-    graph.add_edge("analyze", "human_review")
-
-    graph.add_conditional_edges(
-        "human_review",
-        review_router,
-        {"send": "send", "skip_send": "skip_send"}
-    )
-
-    for node in ("send", "skip_send", "summarize", "archive"):
-        graph.add_conditional_edges(
-            node,
-            should_continue,
-            {"classify": "classify", "send_summary": "send_summary"}
-        )
-
+    # REDUCE: cuando todas las ramas terminan, LangGraph ejecuta send_summary
+    graph.add_edge("email_pipeline", "send_summary")
     graph.add_edge("send_summary", END)
 
     return graph.compile(checkpointer=checkpointer)
@@ -479,27 +432,14 @@ if __name__ == "__main__":
 
     config = {"configurable": {"thread_id": "email-session-1"}}
 
-    initial_state = {
-        "emails":         [],
-        "current_email":  {},
-        "classification": "",
-        "draft_reply":    "",
-        "summary":        "",
-        "processed":      [],
-        "approved":       False,
-        "human_feedback": "",
-        "analysis":       "",
-    }
+    result = app.invoke({"emails": [], "processed": []}, config)
 
-    result = app.invoke(initial_state, config)
-
-    # Loop de HITL: el grafo puede interrumpirse varias veces (una por cada email urgente)
+    # HITL loop: una interrupción por cada email urgente pendiente de revisión
     while True:
         snapshot = app.get_state(config)
         if not snapshot.next:
-            break  # el grafo terminó
+            break
 
-        # Extraer los datos del interrupt
         interrupt_data = snapshot.tasks[0].interrupts[0].value
         print("\n" + "=" * 60)
         print("REVISIÓN HUMANA REQUERIDA")
@@ -512,10 +452,7 @@ if __name__ == "__main__":
         print(interrupt_data["instructions"])
         print("-" * 60)
 
-        decision = input("Tu decisión: ").strip()
-        if not decision:
-            decision = "reject"
-
+        decision = input("Tu decisión: ").strip() or "reject"
         result = app.invoke(Command(resume=decision), config)
 
     print_summary(result["processed"])
