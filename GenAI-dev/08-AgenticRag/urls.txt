@@ -1,0 +1,3 @@
+# Una URL por línea. # = comentario. Edita con tus fuentes.
+https://lilianweng.github.io/posts/2023-06-23-agent/
+https://lilianweng.github.io/posts/2024-07-07-hallucination/
